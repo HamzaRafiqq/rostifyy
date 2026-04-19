@@ -8,6 +8,7 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
 <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;600;700;800&family=Plus+Jakarta+Sans:wght@400;500;600&display=swap" rel="stylesheet">
 <style>
 :root{--bg:#F0F4FF;--sidebar:#0F172A;--card:#fff;--primary:#4F46E5;--primary-light:#EEF2FF;--primary-dark:#4338CA;--accent:#10B981;--accent-light:#D1FAE5;--warn:#F59E0B;--warn-light:#FEF3C7;--danger:#EF4444;--danger-light:#FEE2E2;--text:#1E293B;--muted:#64748B;--border:#E2E8F0;--shadow:0 1px 3px rgba(0,0,0,0.08),0 4px 16px rgba(0,0,0,0.04);--radius:12px}
@@ -244,10 +245,71 @@ function Employees(){
     await db.from('audit_log').insert([{icon:e.is_active?'🔴':'🟢',action:`${e.first_name} marked ${e.is_active?'inactive':'active'}`,type:'employee',user_id:user.id}]);
     load();
   }
+
+  const[showImport,setShowImport]=React.useState(false);
+  const[importing,setImporting]=React.useState(false);
+  const[importData,setImportData]=React.useState([]);
+  const[importErr,setImportErr]=React.useState('');
+  const[importOk,setImportOk]=React.useState('');
+
+  function handleExcel(e){
+    setImportErr('');setImportOk('');setImportData([]);
+    const file=e.target.files[0];
+    if(!file)return;
+    const reader=new FileReader();
+    reader.onload=evt=>{
+      try{
+        const wb=XLSX.read(evt.target.result,{type:'binary'});
+        const ws=wb.Sheets[wb.SheetNames[0]];
+        const rows=XLSX.utils.sheet_to_json(ws,{defval:''});
+        if(!rows.length){setImportErr('Excel file is empty!');return;}
+        // Normalize column names
+        const parsed=rows.map(r=>{
+          const keys=Object.keys(r);
+          function find(...names){const k=keys.find(k=>names.some(n=>k.toLowerCase().includes(n.toLowerCase())));return r[k]||'';}
+          const fullName=find('name','employee','full');
+          const parts=fullName.trim().split(' ');
+          const first=parts[0]||'';
+          const last=parts.slice(1).join(' ')||'';
+          return{
+            first_name:find('first')||first,
+            last_name:find('last','surname')||last,
+            role:find('role','position','job')||'Security Guard',
+            pay_rate:parseFloat(find('pay','rate','wage','salary'))||12.50,
+            contract_type:find('contract','type')||'Full-time',
+            site:find('site','location','place')||'',
+            license_number:find('sia','licence','license')||'',
+            license_expiry:find('expiry','expire')||'',
+            clearance_level:find('clearance','level')||'None',
+          };
+        }).filter(r=>r.first_name);
+        setImportData(parsed);
+      }catch(err){setImportErr('Could not read file. Make sure it is .xlsx or .xls');}
+    };
+    reader.readAsBinaryString(file);
+  }
+
+  async function confirmImport(){
+    if(!importData.length)return;
+    setImporting(true);
+    const{data:{user}}=await db.auth.getUser();
+    const toInsert=importData.map(r=>({...r,is_active:true,user_id:user.id,pay_rate:parseFloat(r.pay_rate)||12.50}));
+    const{error}=await db.from('employees').insert(toInsert);
+    if(error){setImportErr(error.message);setImporting(false);return;}
+    await db.from('audit_log').insert([{icon:'📊',action:`${importData.length} employees imported from Excel`,type:'employee',user_id:user.id}]);
+    setImportOk(`✅ ${importData.length} employees imported successfully!`);
+    setImportData([]);
+    setImporting(false);
+    load();
+    setTimeout(()=>{setShowImport(false);setImportOk('');},2000);
+  }
   if(loading)return <Spin/>;
   return(
     <div className="content">
-      <div style={{display:'flex',justifyContent:'flex-end',marginBottom:16}}><button className="btn btn-primary" onClick={()=>{setShow(true);setErr('')}}>+ Add Employee</button></div>
+      <div style={{display:'flex',justifyContent:'flex-end',marginBottom:16,gap:10}}>
+        <button className="btn btn-secondary" onClick={()=>{setShowImport(true);setImportErr('');setImportOk('');setImportData('');}}>📊 Import from Excel</button>
+        <button className="btn btn-primary" onClick={()=>{setShow(true);setErr('')}}>+ Add Employee</button>
+      </div>
       <div className="card" style={{padding:0}}>
         {emps.length===0?<Empty icon="👥" title="No employees yet" sub="Add your first team member"/>:(
           <div className="table-wrap"><table>
@@ -269,6 +331,52 @@ function Employees(){
           </table></div>
         )}
       </div>
+      {showImport&&<div className="modal-overlay" onClick={e=>e.target===e.currentTarget&&setShowImport(false)}><div className="modal">
+        <div className="modal-title">📊 Import from Excel</div>
+        <div style={{background:'#F8FAFC',border:'1px solid var(--border)',borderRadius:10,padding:16,marginBottom:16}}>
+          <div style={{fontSize:13,fontWeight:600,marginBottom:8}}>Your Excel columns should include:</div>
+          <div style={{fontSize:12,color:'var(--muted)',lineHeight:2}}>
+            • <strong>Name</strong> (or First Name + Last Name separately)<br/>
+            • <strong>Role</strong> — e.g. Security Guard, Supervisor<br/>
+            • <strong>Pay Rate</strong> — e.g. 12.50<br/>
+            • <strong>Site</strong> — e.g. Westfield Shopping Centre<br/>
+            • <strong>Contract</strong> — Full-time / Part-time / Zero hours<br/>
+            • <strong>SIA Licence</strong> (optional)<br/>
+            • <strong>Expiry Date</strong> (optional)
+          </div>
+        </div>
+        {importErr&&<div className="alert alert-error">⚠️ {importErr}</div>}
+        {importOk&&<div className="alert alert-success">{importOk}</div>}
+        <div className="form-group">
+          <label className="form-label">Select your Excel file (.xlsx or .xls)</label>
+          <input className="form-input" type="file" accept=".xlsx,.xls,.csv" onChange={handleExcel}/>
+        </div>
+        {importData.length>0&&<div>
+          <div style={{fontSize:13,fontWeight:600,marginBottom:8,color:'var(--accent)'}}>✅ {importData.length} employees ready to import:</div>
+          <div style={{maxHeight:200,overflowY:'auto',border:'1px solid var(--border)',borderRadius:8}}>
+            <table style={{width:'100%',borderCollapse:'collapse',fontSize:12}}>
+              <thead><tr style={{background:'#F8FAFC'}}>
+                <th style={{padding:'8px 12px',textAlign:'left',borderBottom:'1px solid var(--border)'}}>Name</th>
+                <th style={{padding:'8px 12px',textAlign:'left',borderBottom:'1px solid var(--border)'}}>Role</th>
+                <th style={{padding:'8px 12px',textAlign:'left',borderBottom:'1px solid var(--border)'}}>Pay</th>
+                <th style={{padding:'8px 12px',textAlign:'left',borderBottom:'1px solid var(--border)'}}>Site</th>
+              </tr></thead>
+              <tbody>{importData.map((r,i)=>(
+                <tr key={i}>
+                  <td style={{padding:'8px 12px',borderBottom:'1px solid var(--border)'}}>{r.first_name} {r.last_name}</td>
+                  <td style={{padding:'8px 12px',borderBottom:'1px solid var(--border)'}}>{r.role}</td>
+                  <td style={{padding:'8px 12px',borderBottom:'1px solid var(--border)'}}>£{r.pay_rate}/hr</td>
+                  <td style={{padding:'8px 12px',borderBottom:'1px solid var(--border)'}}>{r.site||'—'}</td>
+                </tr>
+              ))}</tbody>
+            </table>
+          </div>
+        </div>}
+        <div className="modal-footer">
+          <button className="btn btn-secondary" onClick={()=>setShowImport(false)}>Cancel</button>
+          <button className="btn btn-primary" onClick={confirmImport} disabled={!importData.length||importing}>{importing?'Importing...':'Import All Employees'}</button>
+        </div>
+      </div></div>}
       {show&&<div className="modal-overlay" onClick={e=>e.target===e.currentTarget&&setShow(false)}><div className="modal">
         <div className="modal-title">Add Employee</div>
         {err&&<div className="alert alert-error">{err}</div>}
