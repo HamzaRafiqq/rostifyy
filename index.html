@@ -407,13 +407,291 @@ function Employees(){
 }
 
 function Roster(){
-  const[emps,setEmps]=React.useState([]);const[shifts,setShifts]=React.useState([]);const[loading,setLoading]=React.useState(true);
-  const[gen,setGen]=React.useState(false);const[show,setShow]=React.useState(false);
-  const[showCmd,setShowCmd]=React.useState(false);
+  const[emps,setEmps]=React.useState([]);
+  const[shifts,setShifts]=React.useState([]);
+  const[loading,setLoading]=React.useState(true);
+  const[show,setShow]=React.useState(false);
+  const[showSmart,setShowSmart]=React.useState(false);
   const[f,setF]=React.useState({employee_id:'',day:'Monday',shift_type:'am'});
-  const[cmd,setCmd]=React.useState({shift_time:'7am-7pm',pattern:'5on2off',shift_type:'day',days_on:5,days_off:2,site:''});
-  const[cmdPreview,setCmdPreview]=React.useState([]);
-  const[cmdGen,setCmdGen]=React.useState(false);
+
+  // Week selector
+  function getMonday(d=new Date()){const day=d.getDay();const diff=d.getDate()-day+(day===0?-6:1);const m=new Date(d);m.setDate(diff);m.setHours(0,0,0,0);return m;}
+  const[selectedWeek,setSelectedWeek]=React.useState(getMonday());
+  const weekStr=selectedWeek.toISOString().split('T')[0];
+  const weekEnd=new Date(selectedWeek);weekEnd.setDate(selectedWeek.getDate()+6);
+
+  // Smart roster state
+  const[smartShift,setSmartShift]=React.useState('day'); // day or night
+  const[daysOn,setDaysOn]=React.useState('5');
+  const[daysOff,setDaysOff]=React.useState('2');
+  const[selectedGuards,setSelectedGuards]=React.useState({});
+  const[preview,setPreview]=React.useState([]);
+  const[applying,setApplying]=React.useState(false);
+  const[step,setStep]=React.useState(1); // 1=settings, 2=select guards, 3=preview
+
+  React.useEffect(()=>{load();},[weekStr]);
+
+  async function load(){
+    setLoading(true);
+    const[{data:e},{data:s}]=await Promise.all([
+      db.from('employees').select('*').eq('is_active',true).order('first_name'),
+      db.from('shifts').select('*').eq('week_start',weekStr),
+    ]);
+    setEmps(e||[]);setShifts(s||[]);setLoading(false);
+  }
+
+  function gs(eid,day){return shifts.find(s=>s.employee_id===eid&&s.day===day);}
+
+  function prevWeek(){const d=new Date(selectedWeek);d.setDate(d.getDate()-7);setSelectedWeek(d);}
+  function nextWeek(){const d=new Date(selectedWeek);d.setDate(d.getDate()+7);setSelectedWeek(d);}
+  function thisWeek(){setSelectedWeek(getMonday());}
+
+  // Toggle guard selection
+  function toggleGuard(id){setSelectedGuards(prev=>({...prev,[id]:!prev[id]}));}
+  function selectAll(){const all={};emps.forEach(e=>{all[e.id]=true;});setSelectedGuards(all);}
+  function clearAll(){setSelectedGuards({});}
+
+  // Build preview
+  function buildPreview(){
+    const selected=emps.filter(e=>selectedGuards[e.id]);
+    if(!selected.length)return;
+    const shiftType=smartShift==='day'?'am':'night';
+    const on=parseInt(daysOn)||5;
+    const pattern=DAYS.map((_,i)=>i<on?shiftType:'off');
+    const prev=selected.map((e,idx)=>{
+      const offset=idx%(on+parseInt(daysOff));
+      const rotated=[...pattern.slice(offset),...pattern.slice(0,offset)];
+      return{emp:e,days:DAYS.reduce((acc,day,i)=>({...acc,[day]:rotated[i]||'off'}),{})};
+    });
+    setPreview(prev);
+    setStep(3);
+  }
+
+  async function applyRoster(){
+    if(!preview.length)return;
+    setApplying(true);
+    const{data:{user}}=await db.auth.getUser();
+    const ns=[];
+    preview.forEach(({emp,days})=>{
+      DAYS.forEach(day=>{ns.push({employee_id:emp.id,day,shift_type:days[day],week_start:weekStr,user_id:user.id});});
+    });
+    // Only delete shifts for selected guards
+    const ids=preview.map(p=>p.emp.id);
+    await db.from('shifts').delete().eq('week_start',weekStr).in('employee_id',ids);
+    await db.from('shifts').insert(ns);
+    await db.from('audit_log').insert([{icon:'🎯',action:`Smart roster: ${daysOn} days ${smartShift}, ${preview.length} guards — week of ${weekStr}`,type:'roster',user_id:user.id}]);
+    setShowSmart(false);setPreview([]);setStep(1);setSelectedGuards({});
+    load();setApplying(false);
+  }
+
+  async function generate(){
+    if(!emps.length)return;
+    const{data:{user}}=await db.auth.getUser();
+    const ns=[];
+    emps.forEach(e=>{DAYS.forEach(day=>{let t=day==='Sunday'?'off':day==='Saturday'?(Math.random()>.5?'off':'am'):['am','night','off'][Math.floor(Math.random()*3)];ns.push({employee_id:e.id,day,shift_type:t,week_start:weekStr,user_id:user.id});});});
+    await db.from('shifts').delete().eq('week_start',weekStr);
+    await db.from('shifts').insert(ns);
+    await db.from('audit_log').insert([{icon:'🤖',action:'Auto-generated roster',type:'roster',user_id:user.id}]);
+    load();
+  }
+
+  async function assign(){
+    if(!f.employee_id)return;
+    const{data:{user}}=await db.auth.getUser();
+    const ex=gs(f.employee_id,f.day);
+    if(ex)await db.from('shifts').update({shift_type:f.shift_type}).eq('id',ex.id);
+    else await db.from('shifts').insert([{...f,week_start:weekStr,user_id:user.id}]);
+    const e=emps.find(e=>e.id===f.employee_id);
+    await db.from('audit_log').insert([{icon:'📅',action:`${e?.first_name} assigned ${SL[f.shift_type]} on ${f.day}`,type:'roster',user_id:user.id}]);
+    setShow(false);load();
+  }
+
+  if(loading)return <Spin/>;
+
+  const selectedCount=Object.values(selectedGuards).filter(Boolean).length;
+
+  return(
+    <div className="content">
+
+      {/* TOOLBAR */}
+      <div style={{display:'flex',gap:10,alignItems:'center',marginBottom:16,flexWrap:'wrap',justifyContent:'space-between'}}>
+        {/* Week navigation */}
+        <div style={{display:'flex',alignItems:'center',gap:8}}>
+          <button className="btn btn-secondary btn-sm" onClick={prevWeek}>← Prev</button>
+          <button className="btn btn-secondary btn-sm" onClick={thisWeek}>Today</button>
+          <button className="btn btn-secondary btn-sm" onClick={nextWeek}>Next →</button>
+          <div style={{fontSize:13,fontWeight:600,color:'var(--text)',marginLeft:4}}>
+            {selectedWeek.toLocaleDateString('en-GB',{day:'numeric',month:'short'})} – {weekEnd.toLocaleDateString('en-GB',{day:'numeric',month:'short',year:'numeric'})}
+          </div>
+        </div>
+        {/* Action buttons */}
+        <div style={{display:'flex',gap:8}}>
+          <button className="btn btn-secondary" onClick={()=>{setF({...f,employee_id:emps[0]?.id||''});setShow(true)}}>+ Manual Shift</button>
+          <button className="btn btn-secondary" style={{background:'#FEF3C7',borderColor:'#F59E0B',color:'#92400E',fontWeight:700}} onClick={()=>{setShowSmart(true);setStep(1);setCmdPreview&&setCmdPreview([]);}}>🎯 Smart Roster</button>
+          <button className="btn btn-primary" onClick={generate}>🤖 Auto-Generate</button>
+        </div>
+      </div>
+
+      {/* ROSTER TABLE */}
+      {emps.length===0?<div className="card"><Empty icon="📅" title="No employees" sub="Add employees first"/></div>:(
+        <div className="card" style={{padding:0}}>
+          <div className="roster-wrap"><table className="roster-table">
+            <thead><tr>
+              <th>Guard</th>
+              {DAYS.map(d=><th key={d}>{d.slice(0,3)}</th>)}
+              <th>Total</th>
+            </tr></thead>
+            <tbody>{emps.map(e=>{
+              const tot=DAYS.reduce((s,d)=>{const sh=gs(e.id,d);return s+(sh?SH[sh.shift_type]||0:0);},0);
+              return(<tr key={e.id}>
+                <td><div style={{display:'flex',alignItems:'center',gap:8}}><Av n={e.first_name}/><div><div style={{fontWeight:600,fontSize:13}}>{e.first_name} {e.last_name}</div><div style={{fontSize:11,color:'var(--muted)'}}>{e.role}{e.site?` · ${e.site}`:''}</div></div></div></td>
+                {DAYS.map(day=>{const sh=gs(e.id,day);const t=sh?.shift_type||'off';return <td key={day}><span className={`shift-pill shift-${t}`}>{t==='off'?'Off':t==='am'?'DAY':t==='night'?'NGT':t.toUpperCase()}</span></td>;})}
+                <td><strong>{tot}h</strong></td>
+              </tr>);
+            })}</tbody>
+          </table></div>
+        </div>
+      )}
+
+      {/* SMART ROSTER MODAL */}
+      {showSmart&&<div className="modal-overlay" onClick={e=>e.target===e.currentTarget&&setShowSmart(false)}><div className="modal" style={{width:620,maxWidth:'95vw'}}>
+        <div className="modal-title">🎯 Smart Roster Generator</div>
+
+        {/* STEP INDICATOR */}
+        <div style={{display:'flex',gap:0,marginBottom:24,borderRadius:10,overflow:'hidden',border:'1px solid var(--border)'}}>
+          {[{n:1,label:'Set Shift'},{n:2,label:'Pick Guards'},{n:3,label:'Preview'}].map(s=>(
+            <div key={s.n} style={{flex:1,padding:'10px',textAlign:'center',background:step===s.n?'var(--primary)':step>s.n?'var(--accent-light)':'#F8FAFC',color:step===s.n?'#fff':step>s.n?'#059669':'var(--muted)',fontWeight:700,fontSize:12,cursor:'pointer',transition:'all .2s'}} onClick={()=>step>s.n&&setStep(s.n)}>
+              {step>s.n?'✓ ':''}{s.n}. {s.label}
+            </div>
+          ))}
+        </div>
+
+        {/* STEP 1 — SHIFT SETTINGS */}
+        {step===1&&<div>
+          <div style={{fontSize:14,fontWeight:700,marginBottom:16}}>Choose shift type and pattern:</div>
+
+          {/* Day or Night */}
+          <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:12,marginBottom:20}}>
+            <div onClick={()=>setSmartShift('day')} style={{border:`2px solid ${smartShift==='day'?'var(--primary)':'var(--border)'}`,borderRadius:12,padding:20,cursor:'pointer',textAlign:'center',background:smartShift==='day'?'var(--primary-light)':'#fff',transition:'all .2s'}}>
+              <div style={{fontSize:28,marginBottom:8}}>☀️</div>
+              <div style={{fontFamily:'Outfit',fontSize:15,fontWeight:700,color:smartShift==='day'?'var(--primary)':'var(--text)'}}>Day Shift</div>
+              <div style={{fontSize:12,color:'var(--muted)',marginTop:4}}>7am – 7pm (12 hours)</div>
+            </div>
+            <div onClick={()=>setSmartShift('night')} style={{border:`2px solid ${smartShift==='night'?'#4338CA':'var(--border)'}`,borderRadius:12,padding:20,cursor:'pointer',textAlign:'center',background:smartShift==='night'?'#1E1B4B':'#fff',transition:'all .2s'}}>
+              <div style={{fontSize:28,marginBottom:8}}>🌙</div>
+              <div style={{fontFamily:'Outfit',fontSize:15,fontWeight:700,color:smartShift==='night'?'#A5B4FC':'var(--text)'}}>Night Shift</div>
+              <div style={{fontSize:12,color:smartShift==='night'?'#6366F1':'var(--muted)',marginTop:4}}>7pm – 7am (12 hours)</div>
+            </div>
+          </div>
+
+          {/* Pattern */}
+          <div style={{fontSize:13,fontWeight:700,marginBottom:12}}>Select working pattern:</div>
+          <div style={{display:'grid',gridTemplateColumns:'repeat(3,1fr)',gap:8,marginBottom:20}}>
+            {[{on:'4',off:'3',label:'4 on / 3 off'},{on:'5',off:'2',label:'5 on / 2 off'},{on:'6',off:'1',label:'6 on / 1 off'}].map(p=>(
+              <div key={p.on} onClick={()=>{setDaysOn(p.on);setDaysOff(p.off);}} style={{border:`2px solid ${daysOn===p.on?'var(--primary)':'var(--border)'}`,borderRadius:10,padding:14,cursor:'pointer',textAlign:'center',background:daysOn===p.on?'var(--primary-light)':'#fff',transition:'all .2s'}}>
+                <div style={{fontFamily:'Outfit',fontSize:16,fontWeight:800,color:daysOn===p.on?'var(--primary)':'var(--text)'}}>{p.label}</div>
+                <div style={{fontSize:11,color:'var(--muted)',marginTop:2}}>{parseInt(p.on)*12} hrs/week</div>
+              </div>
+            ))}
+          </div>
+
+          {/* Week */}
+          <div style={{background:'#F8FAFC',border:'1px solid var(--border)',borderRadius:10,padding:14,marginBottom:20}}>
+            <div style={{fontSize:12,fontWeight:700,color:'var(--muted)',marginBottom:4,textTransform:'uppercase',letterSpacing:'0.05em'}}>Creating roster for week:</div>
+            <div style={{fontFamily:'Outfit',fontSize:16,fontWeight:700}}>{selectedWeek.toLocaleDateString('en-GB',{weekday:'long',day:'numeric',month:'long',year:'numeric'})} – {weekEnd.toLocaleDateString('en-GB',{day:'numeric',month:'long',year:'numeric'})}</div>
+            <div style={{fontSize:11,color:'var(--muted)',marginTop:4}}>Use the week navigation buttons to change week before opening this</div>
+          </div>
+
+          <div className="modal-footer" style={{marginTop:0}}>
+            <button className="btn btn-secondary" onClick={()=>setShowSmart(false)}>Cancel</button>
+            <button className="btn btn-primary" onClick={()=>setStep(2)}>Next: Pick Guards →</button>
+          </div>
+        </div>}
+
+        {/* STEP 2 — SELECT GUARDS */}
+        {step===2&&<div>
+          <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:12}}>
+            <div style={{fontSize:14,fontWeight:700}}>Select guards for this roster:</div>
+            <div style={{display:'flex',gap:8}}>
+              <button className="btn btn-secondary btn-sm" onClick={selectAll}>Select All</button>
+              <button className="btn btn-secondary btn-sm" onClick={clearAll}>Clear All</button>
+            </div>
+          </div>
+          <div style={{border:'1px solid var(--border)',borderRadius:10,overflow:'hidden',maxHeight:320,overflowY:'auto',marginBottom:16}}>
+            {emps.map((e,i)=>(
+              <div key={e.id} onClick={()=>toggleGuard(e.id)} style={{display:'flex',alignItems:'center',gap:12,padding:'12px 16px',cursor:'pointer',background:selectedGuards[e.id]?'var(--primary-light)':i%2===0?'#FAFBFF':'#fff',borderBottom:'1px solid var(--border)',transition:'background .15s'}}>
+                <div style={{width:20,height:20,border:`2px solid ${selectedGuards[e.id]?'var(--primary)':'var(--border)'}`,borderRadius:5,background:selectedGuards[e.id]?'var(--primary)':'#fff',display:'flex',alignItems:'center',justifyContent:'center',flexShrink:0,transition:'all .15s'}}>
+                  {selectedGuards[e.id]&&<span style={{color:'#fff',fontSize:12,fontWeight:700}}>✓</span>}
+                </div>
+                <Av n={e.first_name}/>
+                <div style={{flex:1}}>
+                  <div style={{fontWeight:600,fontSize:13,color:selectedGuards[e.id]?'var(--primary)':'var(--text)'}}>{e.first_name} {e.last_name}</div>
+                  <div style={{fontSize:11,color:'var(--muted)'}}>{e.role}{e.site?` · ${e.site}`:''}</div>
+                </div>
+                <span className={`badge ${selectedGuards[e.id]?'badge-blue':'badge-gray'}`}>{selectedGuards[e.id]?'Selected':'—'}</span>
+              </div>
+            ))}
+          </div>
+          <div style={{fontSize:13,color:'var(--muted)',marginBottom:16}}><strong style={{color:'var(--primary)'}}>{selectedCount}</strong> guard{selectedCount!==1?'s':''} selected</div>
+          <div className="modal-footer" style={{marginTop:0}}>
+            <button className="btn btn-secondary" onClick={()=>setStep(1)}>← Back</button>
+            <button className="btn btn-primary" onClick={buildPreview} disabled={!selectedCount}>Preview Roster →</button>
+          </div>
+        </div>}
+
+        {/* STEP 3 — PREVIEW */}
+        {step===3&&<div>
+          <div style={{background:'#0F172A',borderRadius:10,padding:14,marginBottom:16,display:'flex',justifyContent:'space-between',alignItems:'center'}}>
+            <div>
+              <div style={{fontSize:11,color:'#818CF8',fontWeight:700,textTransform:'uppercase',letterSpacing:'0.05em',marginBottom:4}}>Roster Summary</div>
+              <div style={{fontFamily:'Outfit',fontSize:15,color:'#fff',fontWeight:700}}>
+                {smartShift==='day'?'☀️ Day Shift (7am–7pm)':'🌙 Night Shift (7pm–7am)'} · {daysOn} on / {daysOff} off
+              </div>
+            </div>
+            <div style={{textAlign:'right'}}>
+              <div style={{fontSize:24,fontWeight:800,color:'#818CF8',fontFamily:'Outfit'}}>{preview.length}</div>
+              <div style={{fontSize:11,color:'#64748B'}}>guards</div>
+            </div>
+          </div>
+          <div style={{overflowX:'auto',borderRadius:10,border:'1px solid var(--border)',maxHeight:280,overflowY:'auto',marginBottom:16}}>
+            <table style={{width:'100%',borderCollapse:'collapse',fontSize:11,minWidth:500}}>
+              <thead><tr style={{background:'#F8FAFC',position:'sticky',top:0}}>
+                <th style={{padding:'8px 12px',textAlign:'left',borderBottom:'1px solid var(--border)',fontWeight:700,color:'var(--muted)',textTransform:'uppercase'}}>Guard</th>
+                {DAYS.map(d=><th key={d} style={{padding:'8px 6px',textAlign:'center',borderBottom:'1px solid var(--border)',fontWeight:700,color:'var(--muted)',textTransform:'uppercase',whiteSpace:'nowrap'}}>{d.slice(0,3)}</th>)}
+                <th style={{padding:'8px 6px',textAlign:'center',borderBottom:'1px solid var(--border)',fontWeight:700,color:'var(--muted)',textTransform:'uppercase'}}>Hrs</th>
+              </tr></thead>
+              <tbody>{preview.map(({emp,days},i)=>{
+                const tot=DAYS.reduce((s,d)=>s+(SH[days[d]]||0),0);
+                return(<tr key={i} style={{background:i%2===0?'#FAFBFF':'#fff'}}>
+                  <td style={{padding:'8px 12px',fontWeight:600,borderBottom:'1px solid var(--border)',whiteSpace:'nowrap'}}>{emp.first_name} {emp.last_name}</td>
+                  {DAYS.map(day=>{const t=days[day]||'off';return<td key={day} style={{padding:'5px 4px',textAlign:'center',borderBottom:'1px solid var(--border)'}}><span className={`shift-pill shift-${t}`} style={{minWidth:36,fontSize:9,padding:'3px 5px'}}>{t==='off'?'Off':t==='am'?'DAY':'NGT'}</span></td>;})}
+                  <td style={{padding:'8px 6px',textAlign:'center',borderBottom:'1px solid var(--border)',fontWeight:700}}>{tot}h</td>
+                </tr>);
+              })}</tbody>
+            </table>
+          </div>
+          <div className="modal-footer" style={{marginTop:0}}>
+            <button className="btn btn-secondary" onClick={()=>setStep(2)}>← Back</button>
+            <button className="btn btn-success" onClick={applyRoster} disabled={applying}>{applying?'⏳ Applying...':'✅ Apply Roster'}</button>
+          </div>
+        </div>}
+
+      </div></div>}
+
+      {/* MANUAL SHIFT MODAL */}
+      {show&&<div className="modal-overlay" onClick={e=>e.target===e.currentTarget&&setShow(false)}><div className="modal">
+        <div className="modal-title">Assign Shift Manually</div>
+        <div className="form-group"><label className="form-label">Guard</label><select className="form-select" value={f.employee_id} onChange={e=>setF({...f,employee_id:e.target.value})}>{emps.map(e=><option key={e.id} value={e.id}>{e.first_name} {e.last_name}</option>)}</select></div>
+        <div className="form-row">
+          <div className="form-group"><label className="form-label">Day</label><select className="form-select" value={f.day} onChange={e=>setF({...f,day:e.target.value})}>{DAYS.map(d=><option key={d}>{d}</option>)}</select></div>
+          <div className="form-group"><label className="form-label">Shift</label><select className="form-select" value={f.shift_type} onChange={e=>setF({...f,shift_type:e.target.value})}><option value="am">☀️ Day (7am–7pm)</option><option value="night">🌙 Night (7pm–7am)</option><option value="off">😴 Day Off</option></select></div>
+        </div>
+        <div className="modal-footer"><button className="btn btn-secondary" onClick={()=>setShow(false)}>Cancel</button><button className="btn btn-primary" onClick={assign}>Assign</button></div>
+      </div></div>}
+
+    </div>
+  );
+}
 
   function mon(){const d=new Date();const day=d.getDay();d.setDate(d.getDate()-day+(day===0?-6:1));d.setHours(0,0,0,0);return d;}
   const ws=mon().toISOString().split('T')[0];
