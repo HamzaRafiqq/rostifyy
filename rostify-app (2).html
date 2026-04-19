@@ -409,13 +409,51 @@ function Employees(){
 function Roster(){
   const[emps,setEmps]=React.useState([]);const[shifts,setShifts]=React.useState([]);const[loading,setLoading]=React.useState(true);
   const[gen,setGen]=React.useState(false);const[show,setShow]=React.useState(false);
+  const[showCmd,setShowCmd]=React.useState(false);
   const[f,setF]=React.useState({employee_id:'',day:'Monday',shift_type:'am'});
+  const[cmd,setCmd]=React.useState({shift_time:'7am-7pm',pattern:'5on2off',shift_type:'day',days_on:5,days_off:2,site:''});
+  const[cmdPreview,setCmdPreview]=React.useState([]);
+  const[cmdGen,setCmdGen]=React.useState(false);
+
   function mon(){const d=new Date();const day=d.getDay();d.setDate(d.getDate()-day+(day===0?-6:1));d.setHours(0,0,0,0);return d;}
   const ws=mon().toISOString().split('T')[0];
   const we=new Date(mon());we.setDate(mon().getDate()+6);
   React.useEffect(()=>{load();},[]);
   async function load(){setLoading(true);const[{data:e},{data:s}]=await Promise.all([db.from('employees').select('*').eq('is_active',true).order('first_name'),db.from('shifts').select('*').eq('week_start',ws)]);setEmps(e||[]);setShifts(s||[]);setLoading(false);}
   function gs(eid,day){return shifts.find(s=>s.employee_id===eid&&s.day===day);}
+
+  // SMART ROSTER COMMAND GENERATOR
+  function buildPreview(){
+    if(!emps.length)return;
+    const daysOn=parseInt(cmd.days_on)||5;
+    const daysOff=parseInt(cmd.days_off)||2;
+    const pattern=[];
+    for(let i=0;i<7;i++){pattern.push(i<daysOn?cmd.shift_type==='night'?'night':(cmd.shift_time==='7am-7pm'?'am':'pm'):'off');}
+    // Filter by site if selected
+    const targetEmps=cmd.site?emps.filter(e=>e.site===cmd.site):emps;
+    const preview=targetEmps.map((e,idx)=>{
+      const offset=idx%7;
+      const rotated=[...pattern.slice(offset),...pattern.slice(0,offset)];
+      return{emp:e,days:DAYS.reduce((acc,day,i)=>({...acc,[day]:rotated[i]||'off'}),{})};
+    });
+    setCmdPreview(preview);
+  }
+
+  async function applyCommandRoster(){
+    if(!cmdPreview.length)return;
+    setCmdGen(true);
+    const{data:{user}}=await db.auth.getUser();
+    const ns=[];
+    cmdPreview.forEach(({emp,days})=>{
+      DAYS.forEach(day=>{ns.push({employee_id:emp.id,day,shift_type:days[day],week_start:ws,user_id:user.id});});
+    });
+    await db.from('shifts').delete().eq('week_start',ws);
+    await db.from('shifts').insert(ns);
+    const patternTxt=`${cmd.days_on} days on, ${cmd.days_off} days off, ${cmd.shift_time}`;
+    await db.from('audit_log').insert([{icon:'🎯',action:`Smart roster generated — ${patternTxt}`,type:'roster',user_id:user.id}]);
+    setShowCmd(false);setCmdPreview([]);load();setCmdGen(false);
+  }
+
   async function generate(){
     if(!emps.length)return;setGen(true);
     const{data:{user}}=await db.auth.getUser();
@@ -442,8 +480,92 @@ function Roster(){
       <div style={{display:'flex',gap:10,justifyContent:'flex-end',marginBottom:16,flexWrap:'wrap'}}>
         <div style={{fontSize:13,color:'var(--muted)',alignSelf:'center'}}>Week: {mon().toLocaleDateString('en-GB',{day:'numeric',month:'short'})} – {we.toLocaleDateString('en-GB',{day:'numeric',month:'short',year:'numeric'})}</div>
         <button className="btn btn-secondary" onClick={()=>{setF({...f,employee_id:emps[0]?.id||''});setShow(true);}}>+ Assign Shift</button>
+        <button className="btn btn-secondary" style={{background:'#FEF3C7',borderColor:'#F59E0B',color:'#92400E'}} onClick={()=>{setShowCmd(true);setCmdPreview([])}}>🎯 Smart Roster</button>
         <button className="btn btn-primary" onClick={generate} disabled={gen}>{gen?'⏳ Generating...':'🤖 Auto-Generate'}</button>
       </div>
+
+      {showCmd&&<div className="modal-overlay" onClick={e=>e.target===e.currentTarget&&setShowCmd(false)}><div className="modal" style={{width:600,maxWidth:'95vw'}}>
+        <div className="modal-title">🎯 Smart Roster Generator</div>
+        <div style={{background:'linear-gradient(135deg,#EEF2FF,#F0FDF4)',border:'1px solid var(--border)',borderRadius:12,padding:16,marginBottom:20}}>
+          <div style={{fontSize:13,fontWeight:600,color:'var(--primary)',marginBottom:4}}>Tell Rostify what roster you need</div>
+          <div style={{fontSize:12,color:'var(--muted)'}}>Set your pattern below — Rostify will rotate all staff fairly and automatically</div>
+        </div>
+        <div className="form-row">
+          <div className="form-group">
+            <label className="form-label">⏰ Shift Time</label>
+            <select className="form-select" value={cmd.shift_time} onChange={e=>setCmd({...cmd,shift_time:e.target.value})}>
+              <option value="7am-7pm">7am – 7pm (12hr Day)</option>
+              <option value="7pm-7am">7pm – 7am (12hr Night)</option>
+              <option value="8am-4pm">8am – 4pm (Morning)</option>
+              <option value="2pm-10pm">2pm – 10pm (Afternoon)</option>
+              <option value="10pm-6am">10pm – 6am (Late Night)</option>
+            </select>
+          </div>
+          <div className="form-group">
+            <label className="form-label">🌙 Shift Type</label>
+            <select className="form-select" value={cmd.shift_type} onChange={e=>setCmd({...cmd,shift_type:e.target.value})}>
+              <option value="am">Day / Morning</option>
+              <option value="pm">Afternoon / Evening</option>
+              <option value="night">Night</option>
+            </select>
+          </div>
+        </div>
+        <div className="form-row">
+          <div className="form-group">
+            <label className="form-label">📅 Days ON per week</label>
+            <select className="form-select" value={cmd.days_on} onChange={e=>setCmd({...cmd,days_on:e.target.value})}>
+              <option value="4">4 days on</option>
+              <option value="5">5 days on</option>
+              <option value="6">6 days on</option>
+              <option value="7">7 days (no days off)</option>
+            </select>
+          </div>
+          <div className="form-group">
+            <label className="form-label">😴 Days OFF per week</label>
+            <select className="form-select" value={cmd.days_off} onChange={e=>setCmd({...cmd,days_off:e.target.value})}>
+              <option value="1">1 day off</option>
+              <option value="2">2 days off</option>
+              <option value="3">3 days off</option>
+            </select>
+          </div>
+        </div>
+        <div className="form-group">
+          <label className="form-label">🏢 Apply to which site? (leave blank for ALL staff)</label>
+          <select className="form-select" value={cmd.site} onChange={e=>setCmd({...cmd,site:e.target.value})}>
+            <option value="">All employees</option>
+            {[...new Set(emps.map(e=>e.site).filter(Boolean))].map(s=><option key={s} value={s}>{s}</option>)}
+          </select>
+        </div>
+        <div style={{background:'#0F172A',borderRadius:10,padding:16,marginBottom:16}}>
+          <div style={{fontSize:11,color:'#818CF8',fontWeight:700,marginBottom:6,textTransform:'uppercase',letterSpacing:'0.05em'}}>Your Roster Command</div>
+          <div style={{fontFamily:'Outfit',fontSize:16,color:'#fff',fontWeight:700}}>
+            {cmd.days_on} days on · {cmd.days_off} day{parseInt(cmd.days_off)>1?'s':''} off · {cmd.shift_time} · {cmd.site||'All staff'}
+          </div>
+          <div style={{fontSize:12,color:'#64748B',marginTop:4}}>Each employee gets a rotating fair schedule automatically</div>
+        </div>
+        <button className="btn btn-primary" style={{width:'100%',justifyContent:'center',marginBottom:16}} onClick={buildPreview}>👁 Preview Roster</button>
+        {cmdPreview.length>0&&<div>
+          <div style={{fontSize:13,fontWeight:700,color:'var(--accent)',marginBottom:8}}>✅ Preview — {cmdPreview.length} employees:</div>
+          <div style={{overflowX:'auto',borderRadius:10,border:'1px solid var(--border)',marginBottom:4,maxHeight:220,overflowY:'auto'}}>
+            <table style={{width:'100%',borderCollapse:'collapse',fontSize:11,minWidth:500}}>
+              <thead><tr style={{background:'#F8FAFC',position:'sticky',top:0}}>
+                <th style={{padding:'8px 10px',textAlign:'left',borderBottom:'1px solid var(--border)',fontWeight:700,color:'var(--muted)',textTransform:'uppercase'}}>Employee</th>
+                {DAYS.map(d=><th key={d} style={{padding:'8px 6px',textAlign:'center',borderBottom:'1px solid var(--border)',fontWeight:700,color:'var(--muted)',textTransform:'uppercase'}}>{d.slice(0,3)}</th>)}
+              </tr></thead>
+              <tbody>{cmdPreview.map(({emp,days},i)=>(
+                <tr key={i} style={{background:i%2===0?'#FAFBFF':'#fff'}}>
+                  <td style={{padding:'8px 10px',fontWeight:600,borderBottom:'1px solid var(--border)',whiteSpace:'nowrap'}}>{emp.first_name} {emp.last_name}</td>
+                  {DAYS.map(day=>{const t=days[day]||'off';return<td key={day} style={{padding:'5px 4px',textAlign:'center',borderBottom:'1px solid var(--border)'}}><span className={`shift-pill shift-${t}`} style={{minWidth:36,fontSize:9,padding:'3px 5px'}}>{t==='off'?'Off':t.toUpperCase()}</span></td>;})}
+                </tr>
+              ))}</tbody>
+            </table>
+          </div>
+        </div>}
+        <div className="modal-footer">
+          <button className="btn btn-secondary" onClick={()=>{setShowCmd(false);setCmdPreview([])}}>Cancel</button>
+          <button className="btn btn-success" onClick={applyCommandRoster} disabled={!cmdPreview.length||cmdGen}>{cmdGen?'⏳ Applying...':'✅ Apply This Roster'}</button>
+        </div>
+      </div></div>}
       {emps.length===0?<div className="card"><Empty icon="📅" title="No employees" sub="Add employees first"/></div>:(
         <div className="card" style={{padding:0}}>
           <div className="roster-wrap"><table className="roster-table">
